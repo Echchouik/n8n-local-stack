@@ -1,0 +1,460 @@
+# Environnement LOCAL de test n8n en MODE QUEUE
+#   main      : UI + API + triggers/cron, pousse les exécutions dans Redis
+#   worker(s) : dépilent Redis et exécutent les workflows (scalables)
+#   webhook   : reçoit les webhooks de production (/webhook/*)
+#
+# Redis en haute disponibilité : 3 nœuds (1 master + 2 replicas) surveillés par 3 sentinelles.
+# n8n ne gère pas Sentinel : il parle à HAProxy, qui ne route que vers le master courant.
+#   n8n -> haproxy:6379 -> redis-1 | redis-2 | redis-3  (celui qui répond role:master)
+#
+# Moteurs : Docker Desktop (macOS) ou Podman rootless (Linux/WSL) — même fichier.
+# Préparation : ./scripts/setup.sh   (.env, certificats, CONTAINER_SOCKET)
+# Lancement : docker compose up -d --remove-orphans   (ou podman compose ...)
+# Scaler     : docker compose up -d --scale n8n-worker=3
+# Failover   : ./scripts/test-failover.sh
+# Accès      : https://n8n.localhost:8443  (Grafana : /grafana/  Prometheus : /prometheus/  Alloy : /alloy/)
+
+# --- Config commune à toutes les instances n8n (DOIT être identique) ---
+x-n8n-env: &n8n-env
+  DB_TYPE: postgresdb
+  DB_POSTGRESDB_HOST: postgres
+  DB_POSTGRESDB_PORT: 5432
+  DB_POSTGRESDB_DATABASE: ${POSTGRES_DB}
+  DB_POSTGRESDB_USER: ${POSTGRES_USER}
+  DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+
+  # Mode queue — Redis via HAProxy (toujours le master courant, même après failover)
+  EXECUTIONS_MODE: queue
+  QUEUE_BULL_REDIS_HOST: haproxy
+  QUEUE_BULL_REDIS_PORT: 6379
+  QUEUE_BULL_REDIS_PASSWORD: ${REDIS_PASSWORD}
+  # Délai toléré sans Redis avant que n8n abandonne (défaut 10s).
+  # Doit couvrir un failover : détection 5s + élection + bascule HAProxy (~8s mesurés).
+  QUEUE_BULL_REDIS_TIMEOUT_THRESHOLD: 30000
+  QUEUE_HEALTH_CHECK_ACTIVE: "true"
+  # Les exécutions manuelles (bouton "Test workflow") partent aussi sur les workers
+  OFFLOAD_MANUAL_EXECUTIONS_TO_WORKERS: "true"
+
+  # Le stockage binaire "filesystem" n'est pas partagé entre conteneurs
+  N8N_DEFAULT_BINARY_DATA_MODE: database
+
+  # Même clé partout, sinon les workers ne peuvent pas déchiffrer les credentials
+  N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:?N8N_ENCRYPTION_KEY doit être défini dans .env}
+
+  N8N_HOST: ${N8N_HOST:-localhost}
+  N8N_PORT: 5678
+  N8N_PROTOCOL: ${N8N_PROTOCOL:-http}
+  WEBHOOK_URL: ${WEBHOOK_URL:-https://n8n.localhost:8443/}
+  N8N_EDITOR_BASE_URL: ${N8N_EDITOR_BASE_URL:-https://n8n.localhost:8443/}
+  GENERIC_TIMEZONE: ${GENERIC_TIMEZONE:-Europe/Paris}
+  TZ: ${GENERIC_TIMEZONE:-Europe/Paris}
+  N8N_PROXY_HOPS: 1
+  N8N_SECURE_COOKIE: ${N8N_SECURE_COOKIE:-true}
+  N8N_DIAGNOSTICS_ENABLED: "false"
+
+  # Node.js ajoute cette CA à ses CA de confiance (requêtes HTTPS sortantes de n8n)
+  NODE_EXTRA_CA_CERTS: /certs/rootCA.pem
+
+  # Métriques Prometheus sur /metrics (main, workers, webhook)
+  N8N_METRICS: "true"
+  # Compteurs d'exécutions (n8n_workflow_started/success/failed_total) + label workflow_id
+  N8N_METRICS_INCLUDE_MESSAGE_EVENT_BUS_METRICS: "true"
+  N8N_METRICS_INCLUDE_WORKFLOW_ID_LABEL: "true"
+
+  # Logs sur stdout -> collectés par Alloy -> Loki
+  N8N_LOG_OUTPUT: console
+  N8N_LOG_LEVEL: ${N8N_LOG_LEVEL:-info}
+
+x-n8n-base: &n8n-base
+  image: docker.io/n8nio/n8n:${N8N_VERSION:-latest}
+  restart: unless-stopped
+  volumes:
+    - n8n_storage:/home/node/.n8n
+    # CA mkcert (certificat public uniquement) pour faire confiance à https://n8n.localhost
+    - ./nginx/certs/rootCA.pem:/certs/rootCA.pem:ro
+  networks:
+    - internal
+    - external   # accès Internet : ce sont les workers qui font les appels HTTP
+  healthcheck:
+    test: ["CMD-SHELL", "wget -q --spider http://localhost:5678/healthz || exit 1"]
+    interval: 10s
+    timeout: 5s
+    retries: 10
+    start_period: 30s
+
+# --- Redis HA : base commune aux nœuds et aux sentinelles ---
+x-redis-env: &redis-env
+  REDIS_PASSWORD: ${REDIS_PASSWORD}
+  # Permet à redis-cli de s'authentifier (healthcheck, debug, test-failover.sh)
+  REDISCLI_AUTH: ${REDIS_PASSWORD}
+  INITIAL_MASTER: redis-1          # master au tout premier démarrage uniquement
+  MASTER_NAME: mymaster            # nom du groupe surveillé par Sentinel
+  SENTINELS: sentinel-1 sentinel-2 sentinel-3
+
+x-redis-node: &redis-node
+  image: docker.io/library/redis:${REDIS_VERSION:-7-alpine}
+  restart: unless-stopped
+  command: ["sh", "/scripts/redis-node.sh"]
+  healthcheck:
+    test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+    interval: 5s
+    timeout: 3s
+    retries: 10
+  networks:
+    - internal
+
+x-sentinel: &sentinel
+  image: docker.io/library/redis:${REDIS_VERSION:-7-alpine}
+  restart: unless-stopped
+  command: ["sh", "/scripts/sentinel.sh"]
+  healthcheck:
+    test: ["CMD-SHELL", "redis-cli -p 26379 ping | grep -q PONG"]
+    interval: 5s
+    timeout: 3s
+    retries: 10
+  # Au 1er démarrage, Sentinel doit pouvoir résoudre redis-1 (sentinel monitor)
+  depends_on:
+    redis-1:
+      condition: service_healthy
+    redis-2:
+      condition: service_healthy
+    redis-3:
+      condition: service_healthy
+  networks:
+    - internal
+
+services:
+  postgres:
+    image: docker.io/library/postgres:18-alpine
+    container_name: n8n_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      # Postgres 18+ : monter /var/lib/postgresql (plus /data)
+      - postgres_storage:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - internal
+
+  # ======================= REDIS HA (Sentinel) =======================
+  # Nœuds : redis-1 est master au 1er démarrage ; ensuite c'est Sentinel qui décide.
+  # Le rôle courant est persisté dans le volume (/data/redis.conf).
+  redis-1:
+    <<: *redis-node
+    container_name: n8n_redis_1
+    environment:
+      <<: *redis-env
+      NODE_NAME: redis-1
+    volumes:
+      - ./redis/redis-node.sh:/scripts/redis-node.sh:ro
+      - redis_1_data:/data
+
+  redis-2:
+    <<: *redis-node
+    container_name: n8n_redis_2
+    environment:
+      <<: *redis-env
+      NODE_NAME: redis-2
+    volumes:
+      - ./redis/redis-node.sh:/scripts/redis-node.sh:ro
+      - redis_2_data:/data
+
+  redis-3:
+    <<: *redis-node
+    container_name: n8n_redis_3
+    environment:
+      <<: *redis-env
+      NODE_NAME: redis-3
+    volumes:
+      - ./redis/redis-node.sh:/scripts/redis-node.sh:ro
+      - redis_3_data:/data
+
+  # Sentinelles : quorum 2/3 pour déclarer le master mort et élire un replica
+  sentinel-1:
+    <<: *sentinel
+    container_name: n8n_sentinel_1
+    environment:
+      <<: *redis-env
+      NODE_NAME: sentinel-1
+    volumes:
+      - ./redis/sentinel.sh:/scripts/sentinel.sh:ro
+      - sentinel_1_data:/data
+
+  sentinel-2:
+    <<: *sentinel
+    container_name: n8n_sentinel_2
+    environment:
+      <<: *redis-env
+      NODE_NAME: sentinel-2
+    volumes:
+      - ./redis/sentinel.sh:/scripts/sentinel.sh:ro
+      - sentinel_2_data:/data
+
+  sentinel-3:
+    <<: *sentinel
+    container_name: n8n_sentinel_3
+    environment:
+      <<: *redis-env
+      NODE_NAME: sentinel-3
+    volumes:
+      - ./redis/sentinel.sh:/scripts/sentinel.sh:ro
+      - sentinel_3_data:/data
+
+  # HAProxy : adresse Redis unique pour n8n, route vers le nœud qui répond role:master
+  haproxy:
+    image: docker.io/library/haproxy:${HAPROXY_VERSION:-3.2-alpine}
+    container_name: n8n_haproxy
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}   # injecté dans haproxy.cfg (tcp-check AUTH)
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    # "healthy" = HAProxy voit un master (et pas seulement : le process tourne)
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8404/metrics | grep -q 'haproxy_backend_active_servers{proxy=\"redis_master\"} 1'"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    depends_on:
+      redis-1:
+        condition: service_healthy
+      redis-2:
+        condition: service_healthy
+      redis-3:
+        condition: service_healthy
+    networks:
+      - internal
+
+  # Instance principale : UI, API, triggers planifiés, file d'attente
+  n8n:
+    <<: *n8n-base
+    container_name: n8n_main
+    ports:
+      - "127.0.0.1:5678:5678"
+    environment:
+      <<: *n8n-env
+      # Les webhooks de prod sont traités par n8n-webhook, pas par le main
+      N8N_DISABLE_PRODUCTION_MAIN_PROCESS: "true"
+      # Seul le main publie l'état de la file Redis (jobs en attente / actifs / terminés / en échec)
+      N8N_METRICS_INCLUDE_QUEUE_METRICS: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      haproxy:
+        condition: service_healthy
+      sentinel-1:
+        condition: service_healthy
+
+  # Workers : pas de container_name pour pouvoir scaler
+  n8n-worker:
+    <<: *n8n-base
+    command: worker --concurrency=${WORKER_CONCURRENCY:-5}
+    environment:
+      <<: *n8n-env
+    depends_on:
+      n8n:
+        condition: service_healthy   # le main applique les migrations DB en premier
+
+  # Webhook processor : reçoit /webhook/* et pousse dans la file
+  n8n-webhook:
+    <<: *n8n-base
+    container_name: n8n_webhook
+    command: webhook
+    environment:
+      <<: *n8n-env
+    depends_on:
+      n8n:
+        condition: service_healthy
+
+  nginx:
+    image: docker.io/library/nginx:1.27-alpine
+    container_name: n8n_nginx
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-8080}:80"    # redirige vers HTTPS
+      - "${HTTPS_PORT:-8443}:443"  # mêmes ports sur tous les moteurs (Podman rootless : pas de port < 1024)
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+    # nginx résout les IP de ses upstreams une seule fois, au démarrage.
+    # restart: true -> compose redémarre nginx quand il recrée l'un de ces services (nouvelle IP).
+    depends_on:
+      n8n:
+        condition: service_healthy
+        restart: true
+      n8n-webhook:
+        condition: service_healthy
+        restart: true
+      grafana:
+        condition: service_started
+        restart: true
+      prometheus:
+        condition: service_started
+        restart: true
+      alloy:
+        condition: service_started
+        restart: true
+    networks:
+      internal:
+        # Depuis les conteneurs, n8n.localhost résout vers nginx (et pas vers le conteneur lui-même)
+        aliases:
+          - n8n.localhost
+      external: {}
+
+  # ======================= MONITORING =======================
+  # Prometheus : collecte les métriques (UI : https://n8n.localhost:8443/prometheus/)
+  prometheus:
+    image: docker.io/prom/prometheus:${PROMETHEUS_VERSION:-latest}
+    container_name: n8n_prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.external-url=https://n8n.localhost:8443/prometheus/
+      - --web.route-prefix=/prometheus
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:9090/prometheus/-/healthy || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - internal
+
+  # Grafana : tableaux de bord + alerting (https://n8n.localhost:8443/grafana/)
+  grafana:
+    image: docker.io/grafana/grafana:${GRAFANA_VERSION:-latest}
+    container_name: n8n_grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD doit être défini dans .env}
+      GF_SERVER_ROOT_URL: https://n8n.localhost:8443/grafana/
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      # Alerting : 10s = minimum imposé par Grafana 13+ (5s refusé au démarrage)
+      GF_UNIFIED_ALERTING_MIN_INTERVAL: 10s
+      # Telegram : lus par grafana/provisioning/alerting/notifications.yml
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?TELEGRAM_BOT_TOKEN doit être défini dans .env}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:?TELEGRAM_CHAT_ID doit être défini dans .env}
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+      - loki
+    networks:
+      - internal
+      - external   # accès Internet : notifications Telegram, import de dashboards, plugins
+
+  # Exporters : traduisent l'état de chaque brique en métriques Prometheus
+  postgres-exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:${POSTGRES_EXPORTER_VERSION:-latest}
+    container_name: n8n_postgres_exporter
+    restart: unless-stopped
+    environment:
+      DATA_SOURCE_URI: postgres:5432/${POSTGRES_DB}?sslmode=disable
+      DATA_SOURCE_USER: ${POSTGRES_USER}
+      DATA_SOURCE_PASS: ${POSTGRES_PASSWORD}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - internal
+
+  # Un seul exporter pour les 3 nœuds ET les 3 sentinelles (mode multi-cibles :
+  # Prometheus appelle /scrape?target=redis://<nœud>, voir prometheus.yml)
+  redis-exporter:
+    image: docker.io/oliver006/redis_exporter:${REDIS_EXPORTER_VERSION:-latest}
+    container_name: n8n_redis_exporter
+    restart: unless-stopped
+    # Adresse vide : l'exporter n'interroge que les cibles passées par /scrape?target=
+    command: ["--redis.addr="]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}   # même mot de passe pour nœuds et sentinelles
+    networks:
+      - internal
+
+  nginx-exporter:
+    image: docker.io/nginx/nginx-prometheus-exporter:${NGINX_EXPORTER_VERSION:-latest}
+    container_name: n8n_nginx_exporter
+    restart: unless-stopped
+    command:
+      - --nginx.scrape-uri=http://nginx:8081/stub_status
+    depends_on:
+      - nginx
+    networks:
+      - internal
+
+  # ======================= LOGS =======================
+  # Loki : stockage et requêtes des logs (consultés depuis Grafana > Explore / Drilldown)
+  loki:
+    image: docker.io/grafana/loki:${LOKI_VERSION:-latest}
+    container_name: n8n_loki
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/config.yaml"]
+    volumes:
+      - ./loki/config.yaml:/etc/loki/config.yaml:ro
+      - loki_data:/loki
+    networks:
+      - internal
+
+  # Alloy : collecteur (remplace Promtail). UI de debug : https://n8n.localhost:8443/alloy/
+  alloy:
+    image: docker.io/grafana/alloy:${ALLOY_VERSION:-latest}
+    container_name: n8n_alloy
+    restart: unless-stopped
+    # Podman rootless : root dans le conteneur = ton utilisateur sur l'hôte -> accès au socket.
+    # Docker Desktop : sans effet particulier (le socket est déjà accessible à root).
+    user: "0"
+    security_opt:
+      - label=disable   # utile seulement avec SELinux actif (ex. OL9) ; ignoré sinon
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --server.http.ui-path-prefix=/alloy
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      # Socket API Docker-compatible du moteur (Docker ou Podman), détecté par scripts/setup.sh
+      - ${CONTAINER_SOCKET:?CONTAINER_SOCKET absent du .env - lancer ./scripts/setup.sh}:/var/run/docker.sock
+      - alloy_data:/var/lib/alloy/data
+    depends_on:
+      - loki
+    networks:
+      - internal
+
+volumes:
+  postgres_storage:
+  n8n_storage:
+  redis_1_data:
+  redis_2_data:
+  redis_3_data:
+  sentinel_1_data:
+  sentinel_2_data:
+  sentinel_3_data:
+  prometheus_data:
+  grafana_data:
+  loki_data:
+  alloy_data:
+
+networks:
+  internal:
+    driver: bridge
+    internal: true
+  external:
+    driver: bridge

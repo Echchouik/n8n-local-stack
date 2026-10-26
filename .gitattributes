@@ -1,0 +1,3 @@
+# Fins de ligne LF partout : indispensable pour les scripts et configs montés dans les conteneurs
+* text=auto eol=lf
+*.sh text eol=lf

@@ -1,0 +1,84 @@
+// Grafana Alloy : collecte les logs de tous les conteneurs via l'API Docker-compatible
+// du moteur (Docker Desktop ou Podman), monté sur /var/run/docker.sock (CONTAINER_SOCKET)
+
+// 1. Découverte des conteneurs
+discovery.docker "containers" {
+  host             = "unix:///var/run/docker.sock"
+  refresh_interval = "10s"   // nouveaux conteneurs (scale des workers) pris en compte vite
+}
+
+// 2. Labels Loki lisibles à partir des métadonnées des conteneurs
+discovery.relabel "containers" {
+  targets = []
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+    target_label  = "project"
+  }
+  // service_name : label standard de Loki 3 / Grafana Logs Drilldown
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service_name"
+  }
+  // stdout / stderr
+  rule {
+    source_labels = ["__meta_docker_container_log_stream"]
+    target_label  = "stream"
+  }
+}
+
+// 3. Lecture des logs (stdout/stderr) de chaque conteneur
+loki.source.docker "containers" {
+  host          = "unix:///var/run/docker.sock"
+  targets       = discovery.docker.containers.targets
+  relabel_rules = discovery.relabel.containers.rules
+  forward_to    = [loki.process.containers.receiver]
+}
+
+// 4. Traitement : on extrait méthode et code HTTP des logs d'accès nginx
+loki.process "containers" {
+  // Postgres, Redis, Grafana... : niveau détecté par Loki (discover_log_levels) -> detected_level
+
+  // nginx : on ignore les accès internes de l'exporter (/stub_status sur 8081, access_log off)
+  // et les sondes de santé éventuelles pour ne pas polluer les logs
+  stage.drop {
+    source     = ""
+    expression = "GET /(healthz|-/healthy|-/ready)"
+    drop_counter_reason = "healthcheck"
+  }
+
+  stage.match {
+    selector = "{service=\"nginx\"}"
+
+    // Format "combined" : IP - user [date] "GET /path HTTP/1.1" 200 1234 "referer" "agent"
+    stage.regex {
+      expression = "^(?P<remote_addr>\\S+) \\S+ \\S+ \\[[^\\]]+\\] \"(?P<method>[A-Z]+) (?P<path>\\S+) \\S+\" (?P<status>\\d{3}) "
+    }
+
+    // Peu de valeurs possibles -> OK en label. Le chemin (path) reste dans la ligne : trop de valeurs.
+    stage.labels {
+      values = {
+        method = "",
+        status = "",
+      }
+    }
+  }
+
+  forward_to = [loki.write.default.receiver]
+}
+
+// 5. Envoi vers Loki
+loki.write "default" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

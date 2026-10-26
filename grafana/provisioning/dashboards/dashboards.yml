@@ -1,0 +1,13 @@
+# Charge les dashboards JSON de /etc/grafana/dashboards (= ./grafana/dashboards)
+# Un sous-dossier = un dossier Grafana (n8n, infrastructure, logs, monitoring)
+apiVersion: 1
+
+providers:
+  - name: homelab
+    type: file
+    disableDeletion: false
+    allowUiUpdates: true          # modifiable dans l'UI ; exporter le JSON pour conserver les changements
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/dashboards
+      foldersFromFilesStructure: true

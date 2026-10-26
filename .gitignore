@@ -1,0 +1,11 @@
+# Secrets locaux
+.env
+
+# Certificats propres à chaque machine (la clé privée ne doit jamais partir sur GitHub)
+nginx/certs/*
+!nginx/certs/.gitkeep
+
+.DS_Store
+
+# Sauvegardes
+*.bak

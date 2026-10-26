@@ -1,0 +1,251 @@
+# Règles d'alerte provisionnées (Grafana Unified Alerting)
+# -> à placer dans grafana/provisioning/alerting/rules.yml
+#
+# Grafana 13+ ne substitue PAS les variables d environnement dans ce fichier :
+# écrire $labels, $values, $1 tels quels (pas de $$ : il resterait littéral et casserait le template).
+#
+# Couverture : tous les conteneurs sauf Grafana lui-même (il ne peut pas alerter sur sa propre panne).
+#   - règle 1 : toute cible Prometheus (n8n main/webhook/workers, exporters, HAProxy, Prometheus, Loki, Alloy)
+#   - règle 2 : Postgres / nginx / chaque nœud Redis / chaque sentinelle, vus à travers leur exporter
+#   - règle 3 : plus aucun worker n8n (un worker arrêté disparaît de la découverte DNS)
+#   - groupe redis-ha : master unique, HAProxy sans master, quorum Sentinel, failover détecté
+#   - Prometheus en panne : les requêtes échouent -> état Error -> alerte "DatasourceError"
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: conteneurs
+    folder: Homelab
+    interval: 10s         # minimum imposé par Grafana 13+ (GF_UNIFIED_ALERTING_MIN_INTERVAL)
+    rules:
+      # ---------- 1. Cible Prometheus injoignable ----------
+      - uid: conteneur-cible-down
+        title: Conteneur injoignable
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 60, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: up
+              instant: true
+              range: false
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: lt, params: [1] }
+        noDataState: OK
+        execErrState: Error
+        for: 5s
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.job }} ({{ $labels.instance }}) est DOWN"
+          description: "Prometheus n'arrive plus à joindre {{ $labels.instance }} depuis au moins 5s."
+
+      # ---------- 2. Postgres / nginx / nœuds Redis / sentinelles (via leur exporter) ----------
+      - uid: conteneur-backend-down
+        title: Service backend DOWN
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 60, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              # redis_up : une série par nœud (job redis) et par sentinelle (job redis-sentinel)
+              expr: >-
+                label_replace(pg_up, "service", "postgres", "", "")
+                or label_replace(redis_up, "service", "$1", "instance", "(.*)")
+                or label_replace(nginx_up, "service", "nginx", "", "")
+              instant: true
+              range: false
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: lt, params: [1] }
+        noDataState: OK
+        execErrState: Error
+        for: 5s
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.service }} est DOWN"
+          description: "L'exporter de {{ $labels.service }} ne parvient plus à joindre le service depuis au moins 5s."
+
+      # ---------- 3. Plus aucun worker n8n ----------
+      - uid: n8n-aucun-worker
+        title: Aucun worker n8n
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 60, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: count(up{job="n8n-worker"} == 1) or vector(0)
+              instant: true
+              range: false
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: lt, params: [1] }
+        noDataState: Alerting
+        execErrState: Error
+        for: 5s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Aucun worker n8n actif"
+          description: "Plus aucun worker ne répond : les exécutions s'accumulent dans la file Redis sans être traitées."
+
+  # ======================= Redis HA (Sentinel + HAProxy) =======================
+  - orgId: 1
+    name: redis-ha
+    folder: Homelab
+    interval: 10s
+    rules:
+      # ---------- 4. Il doit y avoir exactement 1 master ----------
+      # 0 master : failover bloqué (quorum perdu, plus de replica sain)
+      # 2 masters : split-brain, les écritures sur l'un des deux seront perdues
+      # "for: 20s" : pendant un failover normal il y a ~8s sans master (déjà signalé par la règle 7)
+      - uid: redis-master-unique
+        title: Redis — nombre de masters anormal
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 60, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: count(redis_instance_info{job="redis", role="master"}) or vector(0)
+              instant: true
+              range: false
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: math
+              expression: abs($A - 1)
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+        noDataState: Alerting
+        execErrState: Error
+        for: 20s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Redis : {{ $values.A.Value }} master(s) au lieu de 1"
+          description: "0 = plus de master élu (vérifier le quorum Sentinel) ; 2 ou plus = split-brain."
+
+      # ---------- 5. HAProxy ne voit aucun master : n8n n'a plus de Redis ----------
+      - uid: haproxy-redis-sans-master
+        title: HAProxy — aucun master Redis
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 60, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: haproxy_backend_active_servers{proxy="redis_master"}
+              instant: true
+              range: false
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: lt, params: [1] }
+        noDataState: OK          # HAProxy down -> déjà couvert par la règle 1
+        execErrState: Error
+        for: 15s
+        labels:
+          severity: critical
+        annotations:
+          summary: "HAProxy ne route plus vers aucun Redis master"
+          description: "n8n (main, workers, webhook) ne peut plus lire ni écrire dans la file depuis au moins 15s."
+
+      # ---------- 6. Quorum Sentinel perdu ----------
+      - uid: sentinel-quorum
+        title: Sentinel — quorum perdu
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 60, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: count(redis_up{job="redis-sentinel"} == 1) or vector(0)
+              instant: true
+              range: false
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: lt, params: [2] }
+        noDataState: Alerting
+        execErrState: Error
+        for: 5s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Sentinel : {{ $values.A.Value }}/3 sentinelles actives (quorum = 2)"
+          description: "Sous le quorum, plus aucun failover automatique n'est possible si le master tombe."
+
+      # ---------- 7. Failover effectué (lu dans les logs des sentinelles) ----------
+      - uid: redis-failover
+        title: Redis — failover effectué
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 60, to: 0 }
+            datasourceUid: loki
+            model:
+              refId: A
+              # Ligne Sentinel : "... # +switch-master mymaster redis-1 6379 redis-2 6379"
+              expr: >-
+                sum by (old_master, new_master) (count_over_time(
+                {service=~"sentinel-.*"} |= "+switch-master"
+                | pattern "<_> +switch-master <_> <old_master> <_> <new_master> <_>" [1m]))
+              queryType: instant
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+        noDataState: OK
+        execErrState: Error
+        for: 0s
+        labels:
+          severity: warning
+        annotations:
+          summary: "Failover Redis : {{ $labels.old_master }} → {{ $labels.new_master }}"
+          description: "Sentinel a promu {{ $labels.new_master }}. HAProxy bascule seul ; vérifier que {{ $labels.old_master }} revient en replica."

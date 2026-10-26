@@ -1,0 +1,78 @@
+global:
+  # 5s : nécessaire pour détecter un conteneur down rapidement (alerting Grafana)
+  scrape_interval: 5s
+  scrape_timeout: 4s     # doit être < scrape_interval (défaut 10s -> Prometheus refuserait de démarrer)
+  evaluation_interval: 15s
+
+scrape_configs:
+  # Prometheus lui-même
+  - job_name: prometheus
+    metrics_path: /prometheus/metrics
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # n8n : instance principale (UI, API, état de la file)
+  - job_name: n8n-main
+    static_configs:
+      - targets: ["n8n:5678"]
+
+  # n8n : webhook processor
+  - job_name: n8n-webhook
+    static_configs:
+      - targets: ["n8n-webhook:5678"]
+
+  # n8n : workers — découverte DNS, chaque réplica (--scale) est trouvé automatiquement
+  - job_name: n8n-worker
+    dns_sd_configs:
+      - names: ["n8n-worker"]
+        type: A
+        port: 5678
+        # 5s : un worker retiré par --scale disparaît vite des cibles (sinon fausse alerte ~30s)
+        refresh_interval: 5s
+
+  - job_name: postgres
+    static_configs:
+      - targets: ["postgres-exporter:9187"]
+
+  # Redis HA : un seul redis-exporter interroge chaque nœud (mode multi-cibles)
+  #   Prometheus appelle redis-exporter:9121/scrape?target=redis://redis-N:6379
+  #   instance = redis-N  (redis_up=0 si le nœud est arrêté ; up=1 tant que l'exporter répond)
+  - job_name: redis
+    metrics_path: /scrape
+    static_configs:
+      - targets: ["redis-1:6379", "redis-2:6379", "redis-3:6379"]
+    relabel_configs: &redis-multi-target
+      - source_labels: [__address__]
+        target_label: __param_target
+        replacement: redis://$1
+      - source_labels: [__address__]
+        regex: "([^:]+):.*"
+        target_label: instance
+      - target_label: __address__
+        replacement: redis-exporter:9121
+
+  # Sentinelles : même exporter (il détecte redis_mode:sentinel)
+  - job_name: redis-sentinel
+    metrics_path: /scrape
+    static_configs:
+      - targets: ["sentinel-1:26379", "sentinel-2:26379", "sentinel-3:26379"]
+    relabel_configs: *redis-multi-target
+
+  # HAProxy : exporter Prometheus intégré (état des 3 nœuds vus par le proxy, sessions)
+  - job_name: haproxy
+    static_configs:
+      - targets: ["haproxy:8404"]
+
+  - job_name: nginx
+    static_configs:
+      - targets: ["nginx-exporter:9113"]
+
+  # Chaîne de logs : Loki et Alloy exposent aussi leurs propres métriques
+  - job_name: loki
+    static_configs:
+      - targets: ["loki:3100"]
+
+  - job_name: alloy
+    # ui-path-prefix ne concerne que l'UI : les métriques restent sur /metrics
+    static_configs:
+      - targets: ["alloy:12345"]

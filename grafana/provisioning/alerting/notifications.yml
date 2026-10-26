@@ -1,0 +1,25 @@
+# Canal de notification (Telegram) + routage des alertes
+# Secrets lus dans l'environnement du conteneur Grafana (voir docker-compose.yml / .env).
+# TELEGRAM_BOT_TOKEN et TELEGRAM_CHAT_ID doivent être renseignés dans .env,
+# sinon le provisioning échoue et Grafana ne démarre pas.
+apiVersion: 1
+
+contactPoints:
+  - orgId: 1
+    name: homelab
+    receivers:
+      - uid: homelab-telegram
+        type: telegram
+        settings:
+          bottoken: ${TELEGRAM_BOT_TOKEN}
+          chatid: "${TELEGRAM_CHAT_ID}"
+          parse_mode: HTML
+        disableResolveMessage: false   # message "RESOLVED" quand le conteneur revient
+
+policies:
+  - orgId: 1
+    receiver: homelab
+    group_by: [grafana_folder, alertname]
+    group_wait: 5s         # délai avant le 1er envoi (défaut 30s)
+    group_interval: 1m     # délai avant de notifier une nouvelle alerte dans un groupe déjà notifié
+    repeat_interval: 4h    # rappel tant que c'est toujours DOWN
