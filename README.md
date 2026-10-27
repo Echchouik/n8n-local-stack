@@ -9,6 +9,16 @@ Même `docker-compose.yml` sur deux moteurs, pour comparer leur comportement :
 | MacBook (macOS) | **Docker Desktop** | rootful (dans la VM Docker Desktop) |
 | PC Windows (WSL2) | **Podman** | rootless |
 
+## Architecture
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/architecture-dark.svg">
+  <img src="docs/architecture-light.svg" alt="Architecture : nginx → n8n main / webhook / workers → HAProxy → Redis HA (Sentinel), PostgreSQL, et observabilité Prometheus / Loki / Alloy / Grafana → Telegram">
+</picture>
+
+[**Version interactive**](https://echchouik.github.io/n8n-local-stack/architecture.html) (zoom, recherche, focus sur un composant, export).
+Source du diagramme : [`docs/architecture.json`](docs/architecture.json) (format [Archify](https://github.com/tt-a1i/archify)).
+
 ## Prérequis
 
 | | macOS — Docker Desktop | WSL2 (Ubuntu) — Podman |

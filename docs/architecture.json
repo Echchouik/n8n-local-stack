@@ -1,0 +1,349 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Homelab n8n — mode queue, Redis HA et observabilité",
+    "quality_profile": "showcase",
+    "viewBox": [
+      1340,
+      620
+    ]
+  },
+  "components": [
+    {
+      "id": "browser",
+      "type": "external",
+      "label": "Navigateur",
+      "sublabel": "n8n.localhost:8443",
+      "pos": [
+        40,
+        180
+      ],
+      "size": [
+        130,
+        62
+      ]
+    },
+    {
+      "id": "nginx",
+      "type": "security",
+      "label": "Nginx",
+      "sublabel": "TLS mkcert · :8443",
+      "pos": [
+        240,
+        180
+      ],
+      "size": [
+        130,
+        62
+      ]
+    },
+    {
+      "id": "webhook",
+      "type": "backend",
+      "label": "n8n-webhook",
+      "sublabel": "/webhook/*",
+      "pos": [
+        460,
+        50
+      ],
+      "size": [
+        136,
+        62
+      ]
+    },
+    {
+      "id": "main",
+      "type": "backend",
+      "label": "n8n main",
+      "sublabel": "UI · API · cron",
+      "pos": [
+        460,
+        180
+      ],
+      "size": [
+        136,
+        62
+      ]
+    },
+    {
+      "id": "worker",
+      "type": "backend",
+      "label": "n8n-worker ×N",
+      "sublabel": "concurrency 5",
+      "pos": [
+        460,
+        310
+      ],
+      "size": [
+        136,
+        62
+      ]
+    },
+    {
+      "id": "haproxy",
+      "type": "messagebus",
+      "label": "HAProxy",
+      "sublabel": "redis_master :6379",
+      "pos": [
+        700,
+        120
+      ],
+      "size": [
+        140,
+        62
+      ]
+    },
+    {
+      "id": "redis",
+      "type": "database",
+      "label": "Redis HA",
+      "sublabel": "1 master + 2 replicas",
+      "tag": "3 sentinelles · quorum 2",
+      "brand": "redis",
+      "pos": [
+        940,
+        120
+      ],
+      "size": [
+        160,
+        62
+      ]
+    },
+    {
+      "id": "postgres",
+      "type": "database",
+      "label": "PostgreSQL 18",
+      "sublabel": "workflows · binaires",
+      "brand": "postgresql",
+      "pos": [
+        700,
+        310
+      ],
+      "size": [
+        140,
+        62
+      ]
+    },
+    {
+      "id": "prometheus",
+      "type": "cloud",
+      "label": "Prometheus",
+      "sublabel": "+ 3 exporters",
+      "brand": "prometheus",
+      "pos": [
+        940,
+        310
+      ],
+      "size": [
+        160,
+        62
+      ]
+    },
+    {
+      "id": "alloy",
+      "type": "cloud",
+      "label": "Alloy",
+      "sublabel": "socket conteneurs",
+      "pos": [
+        240,
+        490
+      ],
+      "size": [
+        130,
+        62
+      ]
+    },
+    {
+      "id": "loki",
+      "type": "database",
+      "label": "Loki",
+      "sublabel": "logs",
+      "pos": [
+        460,
+        490
+      ],
+      "size": [
+        136,
+        62
+      ]
+    },
+    {
+      "id": "grafana",
+      "type": "frontend",
+      "label": "Grafana",
+      "sublabel": "dashboards · alerting",
+      "brand": "grafana",
+      "pos": [
+        700,
+        490
+      ],
+      "size": [
+        140,
+        62
+      ]
+    },
+    {
+      "id": "telegram",
+      "type": "external",
+      "label": "Telegram",
+      "sublabel": "notifications",
+      "brand": "telegram",
+      "pos": [
+        1170,
+        490
+      ],
+      "size": [
+        130,
+        62
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "Hôte Docker Desktop / Podman rootless",
+      "wraps": [
+        "nginx",
+        "webhook",
+        "main",
+        "worker",
+        "haproxy",
+        "redis",
+        "postgres",
+        "prometheus",
+        "alloy",
+        "loki",
+        "grafana"
+      ],
+      "pad": 26
+    },
+    {
+      "kind": "security-group",
+      "label": "réseau internal (sans Internet)",
+      "wraps": [
+        "haproxy",
+        "redis",
+        "postgres",
+        "prometheus"
+      ],
+      "pad": 14
+    }
+  ],
+  "connections": [
+    {
+      "from": "browser",
+      "to": "nginx",
+      "label": "HTTPS",
+      "variant": "emphasis"
+    },
+    {
+      "from": "nginx",
+      "to": "main",
+      "label": "UI / API",
+      "variant": "emphasis"
+    },
+    {
+      "from": "nginx",
+      "to": "webhook",
+      "label": "/webhook/*",
+      "fromSide": "top",
+      "toSide": "left"
+    },
+    {
+      "from": "main",
+      "to": "haproxy",
+      "label": "enqueue",
+      "variant": "emphasis",
+      "labelAt": [
+        620,
+        211
+      ]
+    },
+    {
+      "from": "webhook",
+      "to": "haproxy",
+      "label": "enqueue"
+    },
+    {
+      "from": "worker",
+      "to": "haproxy",
+      "label": "dequeue",
+      "variant": "emphasis"
+    },
+    {
+      "from": "haproxy",
+      "to": "redis",
+      "label": "role:master",
+      "variant": "emphasis"
+    },
+    {
+      "from": "worker",
+      "to": "postgres",
+      "label": "SQL",
+      "labelAt": [
+        676,
+        341
+      ]
+    },
+    {
+      "from": "prometheus",
+      "to": "redis",
+      "label": "scrape",
+      "variant": "dashed"
+    },
+    {
+      "from": "alloy",
+      "to": "loki",
+      "label": "push logs",
+      "variant": "dashed"
+    },
+    {
+      "from": "grafana",
+      "to": "loki",
+      "label": "LogQL",
+      "variant": "dashed"
+    },
+    {
+      "from": "grafana",
+      "to": "prometheus",
+      "label": "PromQL",
+      "variant": "dashed"
+    },
+    {
+      "from": "grafana",
+      "to": "telegram",
+      "label": "alertes",
+      "variant": "security"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Mode queue",
+      "items": [
+        "main et webhook poussent les exécutions dans Redis (Bull)",
+        "Workers scalables : --scale n8n-worker=3",
+        "Même N8N_ENCRYPTION_KEY sur toutes les instances"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Redis haute dispo",
+      "items": [
+        "n8n ne parle pas Sentinel : HAProxy route vers role:master",
+        "Failover mesuré ~8 s, toléré jusqu'à 30 s",
+        "Test : ./scripts/test-failover.sh"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Observabilité",
+      "items": [
+        "Prometheus scrape n8n, Postgres, Redis, Nginx via /metrics",
+        "Alloy lit stdout des conteneurs → Loki",
+        "Grafana, Prometheus, Alloy exposés derrière Nginx"
+      ]
+    }
+  ]
+}
